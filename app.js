@@ -2,7 +2,10 @@
 const express = require('express');
 const path = require('path');
 const cors = require('cors');
+const cookieParser = require('cookie-parser');
+const crypto = require('crypto');
 const database = require('./database');
+const auth = require('./auth-middleware');
 
 // Create Express application
 const app = express();
@@ -12,16 +15,16 @@ const PORT = 8080;
 // MIDDLEWARE SETUP
 // ==========================================
 
-// Enable CORS for ESP8266 requests
-app.use(cors());
+app.use(cors({
+  origin: true,
+  credentials: true
+}));
 
-// Parse incoming JSON data
 app.use(express.json());
-
-// Parse URL-encoded data
 app.use(express.urlencoded({ extended: true }));
+app.use(cookieParser());
 
-// Serve static files from 'public' folder with proper MIME types
+// Serve static files
 app.use(express.static(path.join(__dirname, 'public'), {
   setHeaders: (res, filepath) => {
     if (filepath.endsWith('.html')) {
@@ -34,21 +37,587 @@ app.use(express.static(path.join(__dirname, 'public'), {
   }
 }));
 
-// Log all incoming requests
+// Log requests
 app.use((req, res, next) => {
   console.log(`${new Date().toISOString()} - ${req.method} ${req.path}`);
   next();
 });
 
 // ==========================================
-// API ENDPOINTS - ATTENDANCE
+// AUTHENTICATION ENDPOINTS
+// ==========================================
+/**
+ * UPDATED LOGIN ENDPOINT - Unified Dashboard for All Teachers
+ * Replace the existing /auth/login endpoint in app.js with this
+ */
+
+app.post('/auth/login', (req, res) => {
+  try {
+    const { username, password } = req.body;
+
+    if (!username || !password) {
+      return res.status(400).json({
+        success: false,
+        message: 'Username and password are required'
+      });
+    }
+
+    const teacher = database.teachers.getByUsername(username);
+
+    if (!teacher) {
+      return res.status(401).json({
+        success: false,
+        message: 'Invalid username or password'
+      });
+    }
+
+    const isValidPassword = database.teachers.verifyPassword(password, teacher.password_hash);
+
+    if (!isValidPassword) {
+      return res.status(401).json({
+        success: false,
+        message: 'Invalid username or password'
+      });
+    }
+
+    // Create session
+    const sessionId = crypto.randomBytes(32).toString('hex');
+    const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24 hours
+
+    database.sessions.create(sessionId, teacher.id, expiresAt.toISOString());
+    database.teachers.updateLastLogin(teacher.id);
+
+    // Get teacher's class assignments
+    const allAssignments = database.teacherClasses.getByTeacher(teacher.id);
+    
+    // Separate CT and ST assignments
+    const ctAssignments = allAssignments.filter(a => a.is_class_teacher);
+    const stAssignments = allAssignments.filter(a => !a.is_class_teacher);
+
+    res.cookie('sessionId', sessionId, {
+      httpOnly: true,
+      maxAge: 24 * 60 * 60 * 1000
+    });
+
+    console.log(`✓ User logged in: ${teacher.username} (${teacher.role})`);
+    console.log(`  CT of: ${ctAssignments.map(a => a.class_name).join(', ') || 'None'}`);
+    console.log(`  ST of: ${stAssignments.map(a => a.class_name).join(', ') || 'None'}`);
+
+    res.json({
+      success: true,
+      message: 'Login successful',
+      data: {
+        sessionId,
+        user: {
+          id: teacher.id,
+          username: teacher.username,
+          name: teacher.name,
+          email: teacher.email,
+          role: teacher.role
+        },
+        assignments: {
+          ct: ctAssignments,  // Classes where they are CT
+          st: stAssignments   // Classes where they are ST
+        },
+        // Determine redirect based on role
+        redirectTo: teacher.role === 'admin' ? '/admin-dashboard.html' : '/teacher-dashboard.html'
+      }
+    });
+
+  } catch (error) {
+    console.error('Login error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Internal server error'
+    });
+  }
+});
+
+/**
+ * POST /auth/logout
+ * Logout endpoint
+ */
+app.post('/auth/logout', auth.isAuthenticated, (req, res) => {
+  try {
+    const sessionId = req.headers['x-session-id'] || req.cookies?.sessionId;
+    
+    if (sessionId) {
+      database.sessions.delete(sessionId);
+    }
+
+    res.clearCookie('sessionId');
+
+    res.json({
+      success: true,
+      message: 'Logged out successfully'
+    });
+
+  } catch (error) {
+    console.error('Logout error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Internal server error'
+    });
+  }
+});
+
+/**
+ * GET /auth/me
+ * Get current user info
+ */
+app.get('/auth/me', auth.isAuthenticated, (req, res) => {
+  try {
+    const classes = database.teacherClasses.getByTeacher(req.user.id);
+
+    res.json({
+      success: true,
+      data: {
+        user: req.user,
+        classes: classes
+      }
+    });
+
+  } catch (error) {
+    console.error('Get user error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Internal server error'
+    });
+  }
+});
+
+// ==========================================
+// ADMIN ENDPOINTS - TEACHER MANAGEMENT
+// ==========================================
+/**
+ * POST /admin/teachers
+ * Create new teacher (Admin only)
+ * FIXED: Accept 'teacher' role and validate properly
+ */
+app.post('/admin/teachers', auth.isAuthenticated, auth.isAdmin, (req, res) => {
+  try {
+    const { username, password, name, email, role } = req.body;
+
+    if (!username || !password || !name || !email) {
+      return res.status(400).json({
+        success: false,
+        message: 'Username, password, name, and email are required'
+      });
+    }
+
+    // FIXED: Accept both 'teacher' and specific teacher roles
+    // Default to 'teacher' if role is not provided
+    const teacherRole = role || 'teacher';
+    
+    // Validate role - accept 'teacher', 'admin', 'class_teacher', 'subject_teacher'
+    const validRoles = ['admin', 'teacher', 'class_teacher', 'subject_teacher'];
+    if (!validRoles.includes(teacherRole)) {
+      return res.status(400).json({
+        success: false,
+        message: `Invalid role. Must be one of: ${validRoles.join(', ')}`
+      });
+    }
+
+    const existing = database.teachers.getByUsername(username);
+    if (existing) {
+      return res.status(409).json({
+        success: false,
+        message: 'Username already exists'
+      });
+    }
+
+    const result = database.teachers.create(username, password, name, email, teacherRole);
+
+    console.log(`✓ Teacher created: ${username} (${teacherRole})`);
+
+    res.status(201).json({
+      success: true,
+      message: 'Teacher created successfully',
+      data: {
+        id: result.lastInsertRowid,
+        username,
+        name,
+        role: teacherRole
+      }
+    });
+
+  } catch (error) {
+    console.error('Create teacher error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to create teacher: ' + error.message
+    });
+  }
+});
+
+/**
+ * GET /admin/teachers
+ * Get all teachers (Admin only)
+ */
+app.get('/admin/teachers', auth.isAuthenticated, auth.isAdmin, (req, res) => {
+  try {
+    const teachers = database.teachers.getAll();
+
+    // Get class assignments for each teacher
+    const teachersWithClasses = teachers.map(teacher => {
+      const classes = database.teacherClasses.getByTeacher(teacher.id);
+      return {
+        ...teacher,
+        classes: classes
+      };
+    });
+
+    res.json({
+      success: true,
+      count: teachers.length,
+      data: teachersWithClasses
+    });
+
+  } catch (error) {
+    console.error('Get teachers error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch teachers'
+    });
+  }
+});
+
+/**
+ * PUT /admin/teachers/:id
+ * Update teacher (Admin only)
+ */
+app.put('/admin/teachers/:id', auth.isAuthenticated, auth.isAdmin, (req, res) => {
+  try {
+    const teacherId = parseInt(req.params.id);
+    const { name, email, role } = req.body;
+
+    if (!name || !email) {
+      return res.status(400).json({
+        success: false,
+        message: 'Name and email are required'
+      });
+    }
+
+    database.teachers.update(teacherId, name, email);
+
+    if (role) {
+      database.teachers.updateRole(teacherId, role);
+    }
+
+    console.log(`✓ Teacher updated: ${teacherId}`);
+
+    res.json({
+      success: true,
+      message: 'Teacher updated successfully'
+    });
+
+  } catch (error) {
+    console.error('Update teacher error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to update teacher'
+    });
+  }
+});
+
+/**
+ * DELETE /admin/teachers/:id
+ * Delete teacher (Admin only)
+ */
+app.delete('/admin/teachers/:id', auth.isAuthenticated, auth.isAdmin, (req, res) => {
+  try {
+    const teacherId = parseInt(req.params.id);
+
+    const result = database.teachers.delete(teacherId);
+
+    if (result.changes === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'Teacher not found'
+      });
+    }
+
+    console.log(`✓ Teacher deleted: ${teacherId}`);
+
+    res.json({
+      success: true,
+      message: 'Teacher deleted successfully'
+    });
+
+  } catch (error) {
+    console.error('Delete teacher error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to delete teacher'
+    });
+  }
+});
+
+// ==========================================
+// ADMIN ENDPOINTS - CLASS ASSIGNMENTS
+// ==========================================
+
+/**
+ * ENHANCED CLASS ASSIGNMENT ENDPOINT
+ * Add this to replace the existing /admin/assign-class POST endpoint in app.js
+ */
+
+/**
+ * POST /admin/assign-class
+ * Assign teacher to class with CT/ST validation
+ * Note: Teachers are created with role='teacher', CT/ST is determined by assignments
+ */
+app.post('/admin/assign-class', auth.isAuthenticated, auth.isAdmin, (req, res) => {
+  try {
+    const { teacherId, className, isClassTeacher } = req.body;
+
+    if (!teacherId || !className) {
+      return res.status(400).json({
+        success: false,
+        message: 'Teacher ID and class name are required'
+      });
+    }
+
+    // Verify teacher exists and is not admin
+    const teacher = database.teachers.getById(teacherId);
+    if (!teacher) {
+      return res.status(404).json({
+        success: false,
+        message: 'Teacher not found'
+      });
+    }
+
+    if (teacher.role === 'admin') {
+      return res.status(400).json({
+        success: false,
+        message: 'Cannot assign classes to admin users'
+      });
+    }
+
+    // VALIDATION 1: Check if trying to assign as Class Teacher
+    if (isClassTeacher) {
+      // Check if teacher already has a CT assignment
+      const existingCT = database.teacherClasses.getCTAssignment(teacherId);
+      
+      if (existingCT && existingCT.class_name !== className) {
+        return res.status(400).json({
+          success: false,
+          message: `This teacher is already Class Teacher of ${existingCT.class_name}. A teacher can only be CT of ONE class. Remove that assignment first or assign as Subject Teacher instead.`
+        });
+      }
+
+      // Check if class already has a different CT
+      const classCT = database.teacherClasses.getClassCT(className);
+      
+      if (classCT && classCT.teacher_id !== teacherId) {
+        return res.status(400).json({
+          success: false,
+          message: `Class ${className} already has a Class Teacher: ${classCT.teacher_name}. Remove them first or assign as Subject Teacher instead.`
+        });
+      }
+    }
+
+    // VALIDATION 2: If assigning as ST, make sure they're not already CT of this class
+    if (!isClassTeacher) {
+      const existingAssignment = database.teacherClasses.getByTeacher(teacherId)
+        .find(a => a.class_name === className && a.is_class_teacher);
+      
+      if (existingAssignment) {
+        return res.status(400).json({
+          success: false,
+          message: `This teacher is already Class Teacher of ${className}. Cannot downgrade to Subject Teacher. Remove the assignment first.`
+        });
+      }
+    }
+
+    // All validations passed - assign the class
+    database.teacherClasses.assign(teacherId, className, isClassTeacher || false);
+
+    const assignmentType = isClassTeacher ? 'Class Teacher' : 'Subject Teacher';
+    console.log(`✓ Teacher ${teacherId} assigned to ${className} as ${assignmentType}`);
+
+    res.json({
+      success: true,
+      message: `Successfully assigned as ${assignmentType} of ${className}`
+    });
+
+  } catch (error) {
+    console.error('Assign class error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to assign class'
+    });
+  }
+});
+/**
+ * DELETE /admin/assign-class
+ * Remove teacher from class (Admin only)
+ */
+app.delete('/admin/assign-class', auth.isAuthenticated, auth.isAdmin, (req, res) => {
+  try {
+    const { teacherId, className } = req.body;
+
+    if (!teacherId || !className) {
+      return res.status(400).json({
+        success: false,
+        message: 'Teacher ID and class name are required'
+      });
+    }
+
+    database.teacherClasses.remove(teacherId, className);
+
+    console.log(`✓ Teacher ${teacherId} removed from ${className}`);
+
+    res.json({
+      success: true,
+      message: 'Teacher removed from class'
+    });
+
+  } catch (error) {
+    console.error('Remove class error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to remove teacher from class'
+    });
+  }
+});
+
+/**
+ * GET /admin/class-assignments
+ * Get all class assignments (Admin only)
+ */
+app.get('/admin/class-assignments', auth.isAuthenticated, auth.isAdmin, (req, res) => {
+  try {
+    const assignments = database.teacherClasses.getAll();
+
+    res.json({
+      success: true,
+      count: assignments.length,
+      data: assignments
+    });
+
+  } catch (error) {
+    console.error('Get assignments error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch assignments'
+    });
+  }
+});
+
+// ==========================================
+// ESP8266 RFID ENDPOINTS (No Authentication Required)
+// ==========================================
+
+/**
+ * POST /api/rfid/scan
+ * Record attendance from ESP8266 RFID reader
+ */
+app.post('/api/rfid/scan', (req, res) => {
+  try {
+    const { cardId, apiKey } = req.body;
+
+    if (!cardId) {
+      return res.status(400).json({
+        success: false,
+        message: 'cardId is required'
+      });
+    }
+
+    const timestamp = new Date().toISOString();
+    const trimmedCardId = cardId.trim();
+    
+    console.log(`📱 ESP8266 scan - Card: "${trimmedCardId}"`);
+
+    // Look up student by card ID
+    const student = database.students.getByCardId(trimmedCardId);
+
+    if (!student) {
+      console.log(`⚠️  Unknown card: ${trimmedCardId}`);
+      
+      // Still record attendance even if student not registered
+      const result = database.attendance.record(
+        trimmedCardId,
+        null,
+        'Unknown Student',
+        'N/A',
+        timestamp
+      );
+
+      return res.json({
+        success: true,
+        message: 'Card scanned but not registered',
+        data: {
+          id: result.lastInsertRowid,
+          cardId: trimmedCardId,
+          student: null,
+          status: 'unknown_card',
+          timestamp: timestamp
+        }
+      });
+    }
+
+    // Student found - record attendance
+    const result = database.attendance.record(
+      trimmedCardId,
+      student.id,
+      student.name,
+      student.class,
+      timestamp
+    );
+
+    console.log(`✓ Attendance recorded: ${student.name} (${student.class})`);
+
+    res.json({
+      success: true,
+      message: 'Attendance recorded successfully',
+      data: {
+        id: result.lastInsertRowid,
+        cardId: trimmedCardId,
+        student: {
+          id: student.id,
+          name: student.name,
+          class: student.class,
+          rollNumber: student.roll_number
+        },
+        status: 'present',
+        timestamp: timestamp
+      }
+    });
+
+  } catch (error) {
+    console.error('ESP8266 scan error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to record attendance',
+      error: error.message
+    });
+  }
+});
+
+/**
+ * GET /api/rfid/test
+ * Test endpoint for ESP8266
+ */
+app.get('/api/rfid/test', (req, res) => {
+  res.json({
+    success: true,
+    message: 'RFID server is online',
+    timestamp: new Date().toISOString(),
+    serverTime: new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })
+  });
+});
+
+
+// ==========================================
+// ATTENDANCE ENDPOINTS (Protected)
 // ==========================================
 
 /**
  * POST /attendance
- * Record attendance from ESP8266 or manual submission
+ * Record attendance (Class teachers only)
  */
-app.post('/attendance', (req, res) => {
+app.post('/attendance', auth.isAuthenticated, auth.canMarkAttendance, (req, res) => {
   try {
     const { cardId, time } = req.body;
 
@@ -60,12 +629,14 @@ app.post('/attendance', (req, res) => {
     }
 
     const timestamp = time || new Date().toISOString();
-    console.log(`📝 Attendance request received for card: ${cardId}`);
+    const trimmedCardId = cardId.trim();
+    
+    console.log(`📝 Attendance request for card: "${trimmedCardId}"`);
 
-    const student = database.students.getByCardId(cardId);
+    const student = database.students.getByCardId(trimmedCardId);
 
     const result = database.attendance.record(
-      cardId,
+      trimmedCardId,
       student ? student.id : null,
       student ? student.name : 'Unknown Student',
       student ? student.class : 'N/A',
@@ -74,7 +645,7 @@ app.post('/attendance', (req, res) => {
 
     console.log('✓ Attendance recorded:', {
       id: result.lastInsertRowid,
-      cardId,
+      cardId: trimmedCardId,
       student: student ? student.name : 'Unknown'
     });
 
@@ -83,7 +654,7 @@ app.post('/attendance', (req, res) => {
       message: 'Attendance recorded successfully',
       data: {
         id: result.lastInsertRowid,
-        cardId: cardId,
+        cardId: trimmedCardId,
         timestamp: timestamp,
         student: student || { name: 'Unknown Student', class: 'N/A' }
       }
@@ -98,10 +669,16 @@ app.post('/attendance', (req, res) => {
   }
 });
 
-app.get('/attendance', (req, res) => {
+/**
+ * GET /attendance/class/:className
+ * Get attendance by class (Teachers with class access)
+ */
+app.get('/attendance/class/:className', auth.isAuthenticated, auth.hasClassAccess, (req, res) => {
   try {
+    const { className } = req.params;
     const limit = parseInt(req.query.limit) || 100;
-    const records = database.attendance.getAll(limit);
+
+    const records = database.attendance.getByClass(className, limit);
 
     res.json({
       success: true,
@@ -110,15 +687,72 @@ app.get('/attendance', (req, res) => {
     });
 
   } catch (error) {
-    console.error('Error fetching attendance:', error);
+    console.error('Error fetching class attendance:', error);
     res.status(500).json({
       success: false,
-      message: 'Failed to fetch attendance records'
+      message: 'Failed to fetch attendance'
     });
   }
 });
 
-app.get('/attendance/latest', (req, res) => {
+/**
+ * GET /attendance/class/:className/today
+ * Get today's attendance for a class
+ */
+app.get('/attendance/class/:className/today', auth.isAuthenticated, auth.hasClassAccess, (req, res) => {
+  try {
+    const { className } = req.params;
+
+    // For class teachers - show detailed records
+    if (req.user.role === 'admin' || req.isClassTeacherForClass) {
+      const records = database.attendance.getTodayByClass(className);
+      const totalStudents = database.students.getByClass(className).length;
+      const presentCount = database.attendance.getTodayCountByClass(className);
+      const absentStudents = database.attendance.getAbsentByClass(className);
+
+      res.json({
+        success: true,
+        data: {
+          records: records,
+          stats: {
+            total: totalStudents,
+            present: presentCount,
+            absent: totalStudents - presentCount
+          },
+          absentStudents: absentStudents
+        }
+      });
+    } else {
+      // For subject teachers - show only counts
+      const totalStudents = database.students.getByClass(className).length;
+      const presentCount = database.attendance.getTodayCountByClass(className);
+
+      res.json({
+        success: true,
+        data: {
+          stats: {
+            total: totalStudents,
+            present: presentCount,
+            absent: totalStudents - presentCount
+          }
+        }
+      });
+    }
+
+  } catch (error) {
+    console.error('Error fetching today\'s attendance:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch today\'s attendance'
+    });
+  }
+});
+
+/**
+ * GET /attendance/latest
+ * Get latest attendance (Admin only)
+ */
+app.get('/attendance/latest', auth.isAuthenticated, auth.isAdmin, (req, res) => {
   try {
     const records = database.attendance.getLatest();
 
@@ -137,70 +771,11 @@ app.get('/attendance/latest', (req, res) => {
   }
 });
 
-app.get('/attendance/today', (req, res) => {
-  try {
-    const records = database.attendance.getToday();
-
-    res.json({
-      success: true,
-      count: records.length,
-      data: records
-    });
-
-  } catch (error) {
-    console.error('Error fetching today\'s attendance:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Failed to fetch today\'s attendance'
-    });
-  }
-});
-
-app.get('/attendance/stats', (req, res) => {
-  try {
-    const stats = database.attendance.getStats();
-    const todayCount = database.attendance.getTodayCount();
-
-    res.json({
-      success: true,
-      data: {
-        ...stats,
-        todayByStudent: todayCount
-      }
-    });
-
-  } catch (error) {
-    console.error('Error fetching stats:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Failed to fetch statistics'
-    });
-  }
-});
-
-app.get('/attendance/student/:id', (req, res) => {
-  try {
-    const studentId = parseInt(req.params.id);
-    const limit = parseInt(req.query.limit) || 50;
-    
-    const records = database.attendance.getByStudent(studentId, limit);
-
-    res.json({
-      success: true,
-      count: records.length,
-      data: records
-    });
-
-  } catch (error) {
-    console.error('Error fetching student attendance:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Failed to fetch student attendance'
-    });
-  }
-});
-
-app.delete('/attendance/clear', (req, res) => {
+/**
+ * DELETE /attendance/clear
+ * Clear all attendance (Admin only)
+ */
+app.delete('/attendance/clear', auth.isAuthenticated, auth.isAdmin, (req, res) => {
   try {
     const result = database.attendance.clearAll();
 
@@ -221,10 +796,14 @@ app.delete('/attendance/clear', (req, res) => {
 });
 
 // ==========================================
-// API ENDPOINTS - STUDENTS
+// STUDENT ENDPOINTS (Protected)
 // ==========================================
 
-app.post('/students/register', (req, res) => {
+/**
+ * POST /students/register
+ * Register new student (Admin and Class Teachers)
+ */
+app.post('/students/register', auth.isAuthenticated, auth.isClassTeacher, (req, res) => {
   try {
     const { cardId, name, studentClass, rollNumber } = req.body;
 
@@ -263,22 +842,18 @@ app.post('/students/register', (req, res) => {
 
   } catch (error) {
     console.error('Error registering student:', error);
-    
-    if (error.code === 'SQLITE_CONSTRAINT') {
-      res.status(409).json({
-        success: false,
-        message: 'Card ID already exists'
-      });
-    } else {
-      res.status(500).json({
-        success: false,
-        message: 'Failed to register student'
-      });
-    }
+    res.status(500).json({
+      success: false,
+      message: 'Failed to register student'
+    });
   }
 });
 
-app.get('/students', (req, res) => {
+/**
+ * GET /students
+ * Get all students (Authenticated users)
+ */
+app.get('/students', auth.isAuthenticated, (req, res) => {
   try {
     const students = database.students.getAll();
 
@@ -297,7 +872,77 @@ app.get('/students', (req, res) => {
   }
 });
 
-app.get('/students/:id', (req, res) => {
+/**
+ * GET /students/class/:className
+ * Get students by class
+ */
+app.get('/students/class/:className', auth.isAuthenticated, auth.hasClassAccess, (req, res) => {
+  try {
+    const { className } = req.params;
+    const students = database.students.getByClass(className);
+
+    res.json({
+      success: true,
+      count: students.length,
+      data: students
+    });
+
+  } catch (error) {
+    console.error('Error fetching students:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch students'
+    });
+  }
+});
+
+// ==========================================
+// STUDENT ENDPOINTS - FULL CRUD FOR ADMIN
+// Add these to app.js after the existing student endpoints
+// ==========================================
+
+/**
+ * GET /admin/students
+ * Get all students with full details (Admin only)
+ */
+app.get('/admin/students', auth.isAuthenticated, auth.isAdmin, (req, res) => {
+  try {
+    const students = database.students.getAll();
+    
+    // Get attendance count for each student
+    const studentsWithStats = students.map(student => {
+      const attendanceCount = database.attendance.getCountByStudent(student.id);
+      const lastAttendance = database.attendance.getLastByStudent(student.id);
+      
+      return {
+        ...student,
+        stats: {
+          totalAttendance: attendanceCount,
+          lastSeen: lastAttendance ? lastAttendance.timestamp : null
+        }
+      };
+    });
+
+    res.json({
+      success: true,
+      count: students.length,
+      data: studentsWithStats
+    });
+
+  } catch (error) {
+    console.error('Get students error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch students'
+    });
+  }
+});
+
+/**
+ * GET /admin/students/:id
+ * Get single student details (Admin only)
+ */
+app.get('/admin/students/:id', auth.isAuthenticated, auth.isAdmin, (req, res) => {
   try {
     const studentId = parseInt(req.params.id);
     const student = database.students.getById(studentId);
@@ -309,13 +954,23 @@ app.get('/students/:id', (req, res) => {
       });
     }
 
+    // Get attendance history
+    const attendanceRecords = database.attendance.getByStudentId(studentId, 50);
+    const attendanceCount = database.attendance.getCountByStudent(studentId);
+
     res.json({
       success: true,
-      data: student
+      data: {
+        ...student,
+        stats: {
+          totalAttendance: attendanceCount,
+          recentAttendance: attendanceRecords
+        }
+      }
     });
 
   } catch (error) {
-    console.error('Error fetching student:', error);
+    console.error('Get student error:', error);
     res.status(500).json({
       success: false,
       message: 'Failed to fetch student'
@@ -323,41 +978,67 @@ app.get('/students/:id', (req, res) => {
   }
 });
 
-app.put('/students/:id', (req, res) => {
+/**
+ * PUT /admin/students/:id
+ * Update student details (Admin only)
+ */
+app.put('/admin/students/:id', auth.isAuthenticated, auth.isAdmin, (req, res) => {
   try {
     const studentId = parseInt(req.params.id);
-    const { name, studentClass, rollNumber } = req.body;
+    const { cardId, name, studentClass, rollNumber } = req.body;
 
     if (!name) {
       return res.status(400).json({
         success: false,
-        message: 'Name is required'
+        message: 'Student name is required'
       });
     }
 
-    const result = database.students.update(
-      studentId,
-      name,
-      studentClass || null,
-      rollNumber || null
-    );
-
-    if (result.changes === 0) {
+    // Check if student exists
+    const existingStudent = database.students.getById(studentId);
+    if (!existingStudent) {
       return res.status(404).json({
         success: false,
         message: 'Student not found'
       });
     }
 
-    console.log('✓ Student updated:', studentId);
+    // If changing card ID, check if new card ID is already used
+    if (cardId && cardId !== existingStudent.card_id) {
+      const cardExists = database.students.getByCardId(cardId);
+      if (cardExists && cardExists.id !== studentId) {
+        return res.status(409).json({
+          success: false,
+          message: 'This card ID is already registered to another student'
+        });
+      }
+    }
+
+    // Update student
+    database.students.update(
+      studentId,
+      cardId || existingStudent.card_id,
+      name,
+      studentClass || null,
+      rollNumber || null
+    );
+
+    console.log(`✓ Student updated: ${name} (ID: ${studentId})`);
 
     res.json({
       success: true,
-      message: 'Student updated successfully'
+      message: 'Student updated successfully',
+      data: {
+        id: studentId,
+        cardId: cardId || existingStudent.card_id,
+        name,
+        class: studentClass,
+        rollNumber
+      }
     });
 
   } catch (error) {
-    console.error('Error updating student:', error);
+    console.error('Update student error:', error);
     res.status(500).json({
       success: false,
       message: 'Failed to update student'
@@ -365,9 +1046,23 @@ app.put('/students/:id', (req, res) => {
   }
 });
 
-app.delete('/students/:id', (req, res) => {
+/**
+ * DELETE /admin/students/:id
+ * Delete student (Admin only)
+ */
+app.delete('/admin/students/:id', auth.isAuthenticated, auth.isAdmin, (req, res) => {
   try {
     const studentId = parseInt(req.params.id);
+
+    const student = database.students.getById(studentId);
+    if (!student) {
+      return res.status(404).json({
+        success: false,
+        message: 'Student not found'
+      });
+    }
+
+    // Delete student (attendance records will remain for historical data)
     const result = database.students.delete(studentId);
 
     if (result.changes === 0) {
@@ -377,7 +1072,7 @@ app.delete('/students/:id', (req, res) => {
       });
     }
 
-    console.log('✓ Student deleted:', studentId);
+    console.log(`✓ Student deleted: ${student.name} (ID: ${studentId})`);
 
     res.json({
       success: true,
@@ -385,7 +1080,7 @@ app.delete('/students/:id', (req, res) => {
     });
 
   } catch (error) {
-    console.error('Error deleting student:', error);
+    console.error('Delete student error:', error);
     res.status(500).json({
       success: false,
       message: 'Failed to delete student'
@@ -393,23 +1088,98 @@ app.delete('/students/:id', (req, res) => {
   }
 });
 
+/**
+ * POST /admin/students/bulk-import
+ * Bulk import students from CSV data (Admin only)
+ */
+app.post('/admin/students/bulk-import', auth.isAuthenticated, auth.isAdmin, (req, res) => {
+  try {
+    const { students } = req.body; // Array of {cardId, name, class, rollNumber}
+
+    if (!Array.isArray(students) || students.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'Students array is required'
+      });
+    }
+
+    const results = {
+      success: 0,
+      failed: 0,
+      errors: []
+    };
+
+    students.forEach((student, index) => {
+      try {
+        const { cardId, name, studentClass, rollNumber } = student;
+
+        if (!cardId || !name) {
+          results.failed++;
+          results.errors.push({
+            row: index + 1,
+            error: 'Missing cardId or name'
+          });
+          return;
+        }
+
+        // Check if card already exists
+        if (database.students.cardExists(cardId)) {
+          results.failed++;
+          results.errors.push({
+            row: index + 1,
+            cardId,
+            error: 'Card ID already registered'
+          });
+          return;
+        }
+
+        // Register student
+        database.students.register(
+          cardId,
+          name,
+          studentClass || null,
+          rollNumber || null
+        );
+
+        results.success++;
+
+      } catch (error) {
+        results.failed++;
+        results.errors.push({
+          row: index + 1,
+          error: error.message
+        });
+      }
+    });
+
+    console.log(`✓ Bulk import: ${results.success} success, ${results.failed} failed`);
+
+    res.json({
+      success: true,
+      message: `Imported ${results.success} students`,
+      data: results
+    });
+
+  } catch (error) {
+    console.error('Bulk import error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to import students'
+    });
+  }
+});
+
+
 // ==========================================
 // UTILITY ENDPOINTS
 // ==========================================
-
-// Add this temporary endpoint to app.js to check:
-app.get('/debug/students', (req, res) => {
-  const students = database.students.getAll();
-  res.json(students);
-});
-
 
 app.get('/test', (req, res) => {
   res.json({
     success: true,
     message: 'Server is running!',
     timestamp: new Date().toISOString(),
-    database: 'SQLite (Local)'
+    database: 'SQLite with Authentication'
   });
 });
 
@@ -417,6 +1187,7 @@ app.get('/health', (req, res) => {
   try {
     const stats = database.attendance.getStats();
     const studentCount = database.students.getAll().length;
+    const teacherCount = database.teachers.getAll().length;
 
     res.json({
       success: true,
@@ -424,6 +1195,7 @@ app.get('/health', (req, res) => {
       database: 'connected',
       stats: {
         students: studentCount,
+        teachers: teacherCount,
         ...stats
       }
     });
@@ -446,11 +1218,12 @@ app.listen(PORT, () => {
   console.log('🎓 RFID Attendance System Started');
   console.log('=================================');
   console.log(`Server: http://localhost:${PORT}`);
-  console.log(`Dashboard: http://localhost:${PORT}/index.html`);
-  console.log(`Register: http://localhost:${PORT}/register.html`);
+  console.log(`Login: http://localhost:${PORT}/login.html`);
   console.log(`Database: SQLite (attendance.db)`);
-  console.log(`\nESP8266 Endpoint: http://YOUR_IP:${PORT}/attendance`);
-  console.log('\nPress Ctrl+C to stop');
+  console.log(`\nDefault Admin:`);
+  console.log(`  Username: admin`);
+  console.log(`  Password: admin123`);
+  console.log(`\nPress Ctrl+C to stop`);
   console.log('=================================\n');
 });
 

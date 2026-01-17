@@ -1,10 +1,12 @@
 /**
- * SQLite Database Configuration
- * Handles all database operations for the RFID attendance system
+ * SQLite Database Configuration with Authentication
+ * Enhanced for CT (1) + ST (multiple) assignments
+ * FIXED: Added missing student and attendance functions
  */
 
 const Database = require('better-sqlite3');
 const path = require('path');
+const bcrypt = require('bcryptjs');
 
 // Create/open database file
 const dbPath = path.join(__dirname, 'attendance.db');
@@ -20,8 +22,52 @@ db.pragma('foreign_keys = ON');
 // ==========================================
 
 /**
+ * Teachers Table - User Authentication
+ */
+db.exec(`
+  CREATE TABLE IF NOT EXISTS teachers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT UNIQUE NOT NULL,
+    password_hash TEXT NOT NULL,
+    name TEXT NOT NULL,
+    email TEXT UNIQUE NOT NULL,
+    role TEXT NOT NULL CHECK(role IN ('admin', 'teacher', 'class_teacher', 'subject_teacher')),
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    last_login DATETIME
+  )
+`);
+
+/**
+ * Teacher Classes Assignment
+ * Enhanced: is_class_teacher = 1 for CT, 0 for ST
+ */
+db.exec(`
+  CREATE TABLE IF NOT EXISTS teacher_classes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    teacher_id INTEGER NOT NULL,
+    class_name TEXT NOT NULL,
+    is_class_teacher BOOLEAN DEFAULT 0,
+    assigned_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (teacher_id) REFERENCES teachers(id) ON DELETE CASCADE,
+    UNIQUE(teacher_id, class_name)
+  )
+`);
+
+/**
+ * Sessions Table - Login Sessions
+ */
+db.exec(`
+  CREATE TABLE IF NOT EXISTS sessions (
+    session_id TEXT PRIMARY KEY,
+    teacher_id INTEGER NOT NULL,
+    expires_at DATETIME NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (teacher_id) REFERENCES teachers(id) ON DELETE CASCADE
+  )
+`);
+
+/**
  * Students Table
- * Stores student information linked to RFID cards
  */
 db.exec(`
   CREATE TABLE IF NOT EXISTS students (
@@ -36,7 +82,6 @@ db.exec(`
 
 /**
  * Attendance Table
- * Stores attendance records with student reference
  */
 db.exec(`
   CREATE TABLE IF NOT EXISTS attendance (
@@ -52,68 +97,190 @@ db.exec(`
 `);
 
 /**
- * Create indexes for better query performance
+ * Create indexes
  */
 db.exec(`
   CREATE INDEX IF NOT EXISTS idx_card_id ON students(card_id);
   CREATE INDEX IF NOT EXISTS idx_attendance_date ON attendance(timestamp);
   CREATE INDEX IF NOT EXISTS idx_attendance_card ON attendance(card_id);
+  CREATE INDEX IF NOT EXISTS idx_sessions_teacher ON sessions(teacher_id);
+  CREATE INDEX IF NOT EXISTS idx_teacher_classes ON teacher_classes(teacher_id);
 `);
 
 console.log('✓ Database tables created/verified');
 
 // ==========================================
-// STUDENT OPERATIONS
+// CREATE DEFAULT ADMIN (if not exists)
+// ==========================================
+const checkAdmin = db.prepare('SELECT COUNT(*) as count FROM teachers WHERE role = ?');
+const adminExists = checkAdmin.get('admin');
+
+if (adminExists.count === 0) {
+  const hashedPassword = bcrypt.hashSync('admin123', 10);
+  const insertAdmin = db.prepare(`
+    INSERT INTO teachers (username, password_hash, name, email, role)
+    VALUES (?, ?, ?, ?, ?)
+  `);
+  
+  insertAdmin.run('admin', hashedPassword, 'System Administrator', 'admin@school.com', 'admin');
+  console.log('✓ Default admin created - Username: admin, Password: admin123');
+}
+
+// ==========================================
+// TEACHER OPERATIONS
 // ==========================================
 
-/**
- * Register a new student
- */
+const createTeacher = db.prepare(`
+  INSERT INTO teachers (username, password_hash, name, email, role)
+  VALUES (?, ?, ?, ?, ?)
+`);
+
+const getTeacherByUsername = db.prepare(`
+  SELECT * FROM teachers WHERE username = ?
+`);
+
+const getTeacherById = db.prepare(`
+  SELECT id, username, name, email, role, created_at, last_login 
+  FROM teachers WHERE id = ?
+`);
+
+const getAllTeachers = db.prepare(`
+  SELECT id, username, name, email, role, created_at, last_login 
+  FROM teachers ORDER BY name ASC
+`);
+
+const updateTeacher = db.prepare(`
+  UPDATE teachers 
+  SET name = ?, email = ?
+  WHERE id = ?
+`);
+
+const updateTeacherRole = db.prepare(`
+  UPDATE teachers 
+  SET role = ?
+  WHERE id = ?
+`);
+
+const deleteTeacher = db.prepare(`
+  DELETE FROM teachers WHERE id = ?
+`);
+
+const updateLastLogin = db.prepare(`
+  UPDATE teachers SET last_login = CURRENT_TIMESTAMP WHERE id = ?
+`);
+
+// ==========================================
+// SESSION OPERATIONS
+// ==========================================
+
+const createSession = db.prepare(`
+  INSERT INTO sessions (session_id, teacher_id, expires_at)
+  VALUES (?, ?, ?)
+`);
+
+const getSession = db.prepare(`
+  SELECT s.*, t.id as teacher_id, t.username, t.name, t.email, t.role
+  FROM sessions s
+  JOIN teachers t ON s.teacher_id = t.id
+  WHERE s.session_id = ? AND s.expires_at > CURRENT_TIMESTAMP
+`);
+
+const deleteSession = db.prepare(`
+  DELETE FROM sessions WHERE session_id = ?
+`);
+
+const cleanExpiredSessions = db.prepare(`
+  DELETE FROM sessions WHERE expires_at <= CURRENT_TIMESTAMP
+`);
+
+// ==========================================
+// TEACHER CLASS ASSIGNMENT - ENHANCED
+// ==========================================
+
+const assignTeacherToClass = db.prepare(`
+  INSERT OR REPLACE INTO teacher_classes (teacher_id, class_name, is_class_teacher)
+  VALUES (?, ?, ?)
+`);
+
+const getTeacherClasses = db.prepare(`
+  SELECT * FROM teacher_classes WHERE teacher_id = ?
+`);
+
+const getClassTeachers = db.prepare(`
+  SELECT tc.*, t.name as teacher_name, t.email, t.role
+  FROM teacher_classes tc
+  JOIN teachers t ON tc.teacher_id = t.id
+  WHERE tc.class_name = ?
+`);
+
+const removeTeacherFromClass = db.prepare(`
+  DELETE FROM teacher_classes 
+  WHERE teacher_id = ? AND class_name = ?
+`);
+
+const getAllClassAssignments = db.prepare(`
+  SELECT tc.*, t.name as teacher_name, t.role
+  FROM teacher_classes tc
+  JOIN teachers t ON tc.teacher_id = t.id
+  ORDER BY tc.class_name, tc.is_class_teacher DESC, t.name
+`);
+
+// NEW: Check if teacher already has a CT assignment
+const getTeacherCTAssignment = db.prepare(`
+  SELECT * FROM teacher_classes 
+  WHERE teacher_id = ? AND is_class_teacher = 1
+`);
+
+// NEW: Count CT assignments for a teacher
+const countCTAssignments = db.prepare(`
+  SELECT COUNT(*) as count FROM teacher_classes 
+  WHERE teacher_id = ? AND is_class_teacher = 1
+`);
+
+// NEW: Check if class already has a CT
+const getClassCT = db.prepare(`
+  SELECT tc.*, t.name as teacher_name 
+  FROM teacher_classes tc
+  JOIN teachers t ON tc.teacher_id = t.id
+  WHERE tc.class_name = ? AND tc.is_class_teacher = 1
+`);
+
+// ==========================================
+// STUDENT OPERATIONS - FIXED
+// ==========================================
+
 const registerStudent = db.prepare(`
   INSERT INTO students (card_id, name, class, roll_number)
   VALUES (?, ?, ?, ?)
 `);
 
-/**
- * Get student by card ID
- */
 const getStudentByCardId = db.prepare(`
   SELECT * FROM students WHERE card_id = ?
 `);
 
-/**
- * Get all students
- */
 const getAllStudents = db.prepare(`
   SELECT * FROM students ORDER BY name ASC
 `);
 
-/**
- * Get student by ID
- */
+const getStudentsByClass = db.prepare(`
+  SELECT * FROM students WHERE class = ? ORDER BY roll_number ASC
+`);
+
 const getStudentById = db.prepare(`
   SELECT * FROM students WHERE id = ?
 `);
 
-/**
- * Update student information
- */
+// FIXED: Added card_id parameter
 const updateStudent = db.prepare(`
   UPDATE students 
-  SET name = ?, class = ?, roll_number = ?
+  SET card_id = ?, name = ?, class = ?, roll_number = ?
   WHERE id = ?
 `);
 
-/**
- * Delete student
- */
 const deleteStudent = db.prepare(`
   DELETE FROM students WHERE id = ?
 `);
 
-/**
- * Check if card ID exists
- */
 const cardIdExists = db.prepare(`
   SELECT COUNT(*) as count FROM students WHERE card_id = ?
 `);
@@ -122,49 +289,44 @@ const cardIdExists = db.prepare(`
 // ATTENDANCE OPERATIONS
 // ==========================================
 
-/**
- * Record attendance
- */
 const recordAttendance = db.prepare(`
   INSERT INTO attendance (card_id, student_id, student_name, class, timestamp)
   VALUES (?, ?, ?, ?, ?)
 `);
 
-/**
- * Get all attendance records
- */
 const getAllAttendance = db.prepare(`
   SELECT * FROM attendance ORDER BY recorded_at DESC LIMIT ?
 `);
 
-/**
- * Get latest attendance records
- */
 const getLatestAttendance = db.prepare(`
   SELECT * FROM attendance ORDER BY recorded_at DESC LIMIT 10
 `);
 
-/**
- * Get today's attendance
- */
 const getTodayAttendance = db.prepare(`
   SELECT * FROM attendance 
   WHERE DATE(timestamp) = DATE('now')
   ORDER BY timestamp DESC
 `);
 
-/**
- * Get attendance by date range
- */
+const getTodayAttendanceByClass = db.prepare(`
+  SELECT * FROM attendance 
+  WHERE DATE(timestamp) = DATE('now') AND class = ?
+  ORDER BY timestamp DESC
+`);
+
+const getAttendanceByClass = db.prepare(`
+  SELECT * FROM attendance 
+  WHERE class = ?
+  ORDER BY timestamp DESC
+  LIMIT ?
+`);
+
 const getAttendanceByDateRange = db.prepare(`
   SELECT * FROM attendance 
   WHERE DATE(timestamp) BETWEEN ? AND ?
   ORDER BY timestamp DESC
 `);
 
-/**
- * Get attendance for specific student
- */
 const getStudentAttendance = db.prepare(`
   SELECT * FROM attendance 
   WHERE student_id = ?
@@ -172,9 +334,6 @@ const getStudentAttendance = db.prepare(`
   LIMIT ?
 `);
 
-/**
- * Get attendance count for today by student
- */
 const getTodayAttendanceCount = db.prepare(`
   SELECT student_id, student_name, COUNT(*) as count
   FROM attendance
@@ -182,16 +341,31 @@ const getTodayAttendanceCount = db.prepare(`
   GROUP BY student_id, student_name
 `);
 
-/**
- * Clear all attendance records
- */
+const getTodayCountByClass = db.prepare(`
+  SELECT 
+    COUNT(DISTINCT student_id) as present_count,
+    class
+  FROM attendance
+  WHERE DATE(timestamp) = DATE('now') AND class = ?
+  GROUP BY class
+`);
+
+const getAbsentStudentsByClass = db.prepare(`
+  SELECT s.* 
+  FROM students s
+  WHERE s.class = ?
+  AND s.id NOT IN (
+    SELECT DISTINCT student_id 
+    FROM attendance 
+    WHERE DATE(timestamp) = DATE('now') AND student_id IS NOT NULL
+  )
+  ORDER BY s.roll_number
+`);
+
 const clearAllAttendance = db.prepare(`
   DELETE FROM attendance
 `);
 
-/**
- * Get attendance statistics
- */
 const getAttendanceStats = db.prepare(`
   SELECT 
     COUNT(*) as total_records,
@@ -202,6 +376,15 @@ const getAttendanceStats = db.prepare(`
   FROM attendance
 `);
 
+const getAttendanceStatsByClass = db.prepare(`
+  SELECT 
+    COUNT(*) as total_records,
+    COUNT(DISTINCT student_id) as unique_students,
+    COUNT(CASE WHEN DATE(timestamp) = DATE('now') THEN 1 END) as today_count
+  FROM attendance
+  WHERE class = ?
+`);
+
 // ==========================================
 // EXPORT DATABASE FUNCTIONS
 // ==========================================
@@ -209,7 +392,105 @@ const getAttendanceStats = db.prepare(`
 module.exports = {
   db,
   
-  // Student operations
+  // Teacher operations
+  teachers: {
+    create: (username, password, name, email, role) => {
+      const hashedPassword = bcrypt.hashSync(password, 10);
+      return createTeacher.run(username, hashedPassword, name, email, role);
+    },
+    
+    getByUsername: (username) => {
+      return getTeacherByUsername.get(username);
+    },
+    
+    getById: (id) => {
+      return getTeacherById.get(id);
+    },
+    
+    getAll: () => {
+      return getAllTeachers.all();
+    },
+    
+    update: (id, name, email) => {
+      return updateTeacher.run(name, email, id);
+    },
+    
+    updateRole: (id, role) => {
+      return updateTeacherRole.run(role, id);
+    },
+    
+    delete: (id) => {
+      return deleteTeacher.run(id);
+    },
+    
+    updateLastLogin: (id) => {
+      return updateLastLogin.run(id);
+    },
+    
+    verifyPassword: (plainPassword, hashedPassword) => {
+      return bcrypt.compareSync(plainPassword, hashedPassword);
+    }
+  },
+  
+  // Session operations
+  sessions: {
+    create: (sessionId, teacherId, expiresAt) => {
+      return createSession.run(sessionId, teacherId, expiresAt);
+    },
+    
+    get: (sessionId) => {
+      return getSession.get(sessionId);
+    },
+    
+    delete: (sessionId) => {
+      return deleteSession.run(sessionId);
+    },
+    
+    cleanExpired: () => {
+      return cleanExpiredSessions.run();
+    }
+  },
+  
+  // Teacher class assignments - ENHANCED
+  teacherClasses: {
+    assign: (teacherId, className, isClassTeacher) => {
+      return assignTeacherToClass.run(teacherId, className, isClassTeacher ? 1 : 0);
+    },
+    
+    getByTeacher: (teacherId) => {
+      return getTeacherClasses.all(teacherId);
+    },
+    
+    getByClass: (className) => {
+      return getClassTeachers.all(className);
+    },
+    
+    remove: (teacherId, className) => {
+      return removeTeacherFromClass.run(teacherId, className);
+    },
+    
+    getAll: () => {
+      return getAllClassAssignments.all();
+    },
+    
+    // NEW: Get teacher's CT assignment (should be max 1)
+    getCTAssignment: (teacherId) => {
+      return getTeacherCTAssignment.get(teacherId);
+    },
+    
+    // NEW: Check if teacher already has CT role
+    hasCTAssignment: (teacherId) => {
+      const result = countCTAssignments.get(teacherId);
+      return result.count > 0;
+    },
+    
+    // NEW: Get class's CT (should be max 1 per class)
+    getClassCT: (className) => {
+      return getClassCT.get(className);
+    }
+  },
+  
+  // Student operations - FIXED
   students: {
     register: (cardId, name, studentClass, rollNumber) => {
       return registerStudent.run(cardId, name, studentClass, rollNumber);
@@ -227,8 +508,13 @@ module.exports = {
       return getAllStudents.all();
     },
     
-    update: (id, name, studentClass, rollNumber) => {
-      return updateStudent.run(name, studentClass, rollNumber, id);
+    getByClass: (className) => {
+      return getStudentsByClass.all(className);
+    },
+    
+    // FIXED: Added cardId parameter and correct parameter order
+    update: (id, cardId, name, studentClass, rollNumber) => {
+      return updateStudent.run(cardId, name, studentClass, rollNumber, id);
     },
     
     delete: (id) => {
@@ -241,7 +527,7 @@ module.exports = {
     }
   },
   
-  // Attendance operations
+  // Attendance operations - ENHANCED WITH MISSING FUNCTIONS
   attendance: {
     record: (cardId, studentId, studentName, studentClass, timestamp) => {
       return recordAttendance.run(cardId, studentId, studentName, studentClass, timestamp);
@@ -259,6 +545,14 @@ module.exports = {
       return getTodayAttendance.all();
     },
     
+    getTodayByClass: (className) => {
+      return getTodayAttendanceByClass.all(className);
+    },
+    
+    getByClass: (className, limit = 100) => {
+      return getAttendanceByClass.all(className, limit);
+    },
+    
     getByDateRange: (startDate, endDate) => {
       return getAttendanceByDateRange.all(startDate, endDate);
     },
@@ -271,12 +565,58 @@ module.exports = {
       return getTodayAttendanceCount.all();
     },
     
+    getTodayCountByClass: (className) => {
+      const result = getTodayCountByClass.get(className);
+      return result ? result.present_count : 0;
+    },
+    
+    getAbsentByClass: (className) => {
+      return getAbsentStudentsByClass.all(className);
+    },
+    
     clearAll: () => {
       return clearAllAttendance.run();
     },
     
     getStats: () => {
       return getAttendanceStats.get();
+    },
+    
+    getStatsByClass: (className) => {
+      return getAttendanceStatsByClass.get(className);
+    },
+    
+    // NEW: Get attendance count by student ID
+    getCountByStudent: (studentId) => {
+      const stmt = db.prepare(`
+        SELECT COUNT(*) as count 
+        FROM attendance 
+        WHERE student_id = ?
+      `);
+      const result = stmt.get(studentId);
+      return result.count;
+    },
+    
+    // NEW: Get last attendance by student ID
+    getLastByStudent: (studentId) => {
+      const stmt = db.prepare(`
+        SELECT * FROM attendance 
+        WHERE student_id = ? 
+        ORDER BY timestamp DESC 
+        LIMIT 1
+      `);
+      return stmt.get(studentId);
+    },
+    
+    // NEW: Get attendance records by student ID with limit
+    getByStudentId: (studentId, limit = 50) => {
+      const stmt = db.prepare(`
+        SELECT * FROM attendance 
+        WHERE student_id = ? 
+        ORDER BY timestamp DESC 
+        LIMIT ?
+      `);
+      return stmt.all(studentId, limit);
     }
   }
 };
