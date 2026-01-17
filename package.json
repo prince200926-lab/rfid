@@ -1,0 +1,25 @@
+{
+  "name": "rfid-attendance-system",
+  "version": "1.0.0",
+  "description": "Simple RFID attendance tracking system for schools",
+  "main": "app.js",
+  "scripts": {
+    "start": "node app.js",
+    "dev": "node app.js"
+  },
+  "keywords": [
+    "attendance",
+    "rfid",
+    "school",
+    "express"
+  ],
+  "author": "Your Name",
+  "license": "MIT",
+  "dependencies": {
+    "better-sqlite3": "^12.6.2",
+    "cors": "^2.8.5",
+    "express": "^4.18.2",
+    "firebase-admin": "^12.0.0",
+    "sqlite3": "^5.1.7"
+  }
+}
