@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>Teacher Dashboard - RFID Attendance</title>
     <link rel="stylesheet" href="dashboard-style.css">
     <style>
@@ -11,12 +11,6 @@
             grid-template-columns: 1fr 1fr;
             gap: 20px;
             margin-top: 20px;
-        }
-
-        @media (max-width: 1200px) {
-            .section-container {
-                grid-template-columns: 1fr;
-            }
         }
 
         .dashboard-section {
@@ -242,6 +236,47 @@
 
         .btn-view-history:hover {
             background: #F57C00;
+        }
+
+        /* Mobile Responsive */
+        @media (max-width: 1200px) {
+            .section-container {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        @media (max-width: 768px) {
+            .section-header h2 {
+                font-size: 18px;
+            }
+
+            .stats-mini-grid {
+                grid-template-columns: 1fr;
+            }
+
+            .stat-mini-card p {
+                font-size: 20px;
+            }
+
+            .card-input-group {
+                flex-direction: column;
+            }
+
+            .card-input-group button {
+                width: 100%;
+            }
+
+            .student-lists {
+                grid-template-columns: 1fr;
+            }
+
+            .quick-actions {
+                flex-direction: column;
+            }
+
+            .dashboard-section {
+                padding: 15px;
+            }
         }
     </style>
 </head>

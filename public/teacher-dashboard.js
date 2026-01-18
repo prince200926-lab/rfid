@@ -1,19 +1,68 @@
-// Session and Auth
+// ==========================================
+// MOBILE MENU INITIALIZATION
+// ==========================================
+(function initMobileMenu() {
+    const menuBtn = document.createElement('button');
+    menuBtn.className = 'mobile-menu-btn';
+    menuBtn.innerHTML = '☰';
+    menuBtn.setAttribute('aria-label', 'Toggle menu');
+    document.body.appendChild(menuBtn);
+
+    const overlay = document.createElement('div');
+    overlay.className = 'sidebar-overlay';
+    document.body.appendChild(overlay);
+
+    const sidebar = document.querySelector('.sidebar');
+
+    function toggleMenu() {
+        sidebar.classList.toggle('mobile-open');
+        overlay.classList.toggle('active');
+        menuBtn.innerHTML = sidebar.classList.contains('mobile-open') ? '✕' : '☰';
+    }
+
+    function closeMenu() {
+        sidebar.classList.remove('mobile-open');
+        overlay.classList.remove('active');
+        menuBtn.innerHTML = '☰';
+    }
+
+    menuBtn.addEventListener('click', toggleMenu);
+    overlay.addEventListener('click', closeMenu);
+
+    const navItems = document.querySelectorAll('.nav-item');
+    navItems.forEach(item => {
+        item.addEventListener('click', () => {
+            if (window.innerWidth <= 768) {
+                closeMenu();
+            }
+        });
+    });
+
+    window.addEventListener('resize', () => {
+        if (window.innerWidth > 768) {
+            closeMenu();
+        }
+    });
+})();
+
+// ==========================================
+// SESSION AND AUTH
+// ==========================================
 let sessionId = localStorage.getItem('sessionId');
 let currentUser = JSON.parse(localStorage.getItem('user') || '{}');
 let assignments = JSON.parse(localStorage.getItem('assignments') || '{"ct":[],"st":[]}');
 
-// Check authentication
 if (!sessionId || !currentUser.id) {
     window.location.href = '/login.html';
 }
 
-// Redirect admin to admin dashboard
 if (currentUser.role === 'admin') {
     window.location.href = '/admin-dashboard.html';
 }
 
-// DOM Elements
+// ==========================================
+// DOM ELEMENTS
+// ==========================================
 const logoutBtn = document.getElementById('logoutBtn');
 const userName = document.getElementById('userName');
 const currentDate = document.getElementById('currentDate');
@@ -23,7 +72,6 @@ const stSection = document.getElementById('stSection');
 const ctContent = document.getElementById('ctContent');
 const stContent = document.getElementById('stContent');
 
-// Set user info
 userName.textContent = currentUser.name || 'Teacher';
 currentDate.textContent = new Date().toLocaleDateString('en-US', {
     weekday: 'long',
@@ -32,14 +80,12 @@ currentDate.textContent = new Date().toLocaleDateString('en-US', {
     day: 'numeric'
 });
 
-// Current selected classes
 let selectedCTClass = null;
 let selectedSTClass = null;
 
 // ==========================================
 // API HELPER
 // ==========================================
-
 async function apiCall(endpoint, options = {}) {
     try {
         const response = await fetch(endpoint, {
@@ -67,16 +113,13 @@ async function apiCall(endpoint, options = {}) {
 // ==========================================
 // INITIALIZE DASHBOARD
 // ==========================================
-
 async function initDashboard() {
     console.log('Initializing dashboard...');
     console.log('CT assignments:', assignments.ct);
     console.log('ST assignments:', assignments.st);
 
-    // Update sidebar
     updateSidebar();
 
-    // Initialize CT section
     if (assignments.ct && assignments.ct.length > 0) {
         selectedCTClass = assignments.ct[0].class_name;
         await initCTSection();
@@ -90,7 +133,6 @@ async function initDashboard() {
         `;
     }
 
-    // Initialize ST section
     if (assignments.st && assignments.st.length > 0) {
         selectedSTClass = assignments.st[0].class_name;
         await initSTSection();
@@ -108,7 +150,6 @@ async function initDashboard() {
 // ==========================================
 // UPDATE SIDEBAR
 // ==========================================
-
 function updateSidebar() {
     let html = '';
 
@@ -140,11 +181,9 @@ function updateSidebar() {
 // ==========================================
 // CLASS TEACHER SECTION
 // ==========================================
-
 async function initCTSection() {
     let html = '';
 
-    // Class selector (if multiple CT classes)
     if (assignments.ct.length > 1) {
         html += `
             <div class="class-selector">
@@ -162,10 +201,8 @@ async function initCTSection() {
         html += `<h3 style="margin: 0 0 15px 0; color: #4CAF50;">Class: ${selectedCTClass}</h3>`;
     }
 
-    // Stats
     html += '<div id="ctStats"><p class="loading">Loading stats...</p></div>';
 
-    // Attendance controls
     html += `
         <div class="attendance-controls">
             <h4 style="margin: 0 0 10px 0;">Mark Attendance</h4>
@@ -176,7 +213,6 @@ async function initCTSection() {
         </div>
     `;
 
-    // Student lists
     html += `
         <div class="student-lists">
             <div class="student-list-box">
@@ -190,7 +226,6 @@ async function initCTSection() {
         </div>
     `;
 
-    // Quick actions
     html += `
         <div class="quick-actions">
             <button class="btn-add-student" onclick="showAddStudentModal()">+ Add Student</button>
@@ -199,14 +234,10 @@ async function initCTSection() {
     `;
 
     ctContent.innerHTML = html;
-
-    // Load data
     await loadCTData();
 
-    // Auto-focus card input
     document.getElementById('ctCardInput')?.focus();
 
-    // Listen for Enter key
     document.getElementById('ctCardInput')?.addEventListener('keypress', (e) => {
         if (e.key === 'Enter') {
             markCTAttendance();
@@ -215,11 +246,9 @@ async function initCTSection() {
 }
 
 async function loadCTData() {
-    // Load stats and attendance
     const result = await apiCall(`/attendance/class/${selectedCTClass}/today`);
 
     if (result && result.success) {
-        // Update stats
         const stats = result.data.stats;
         document.getElementById('ctStats').innerHTML = `
             <div class="stats-mini-grid">
@@ -238,11 +267,9 @@ async function loadCTData() {
             </div>
         `;
 
-        // Update counts
         document.getElementById('ctPresentCount').textContent = stats.present;
         document.getElementById('ctAbsentCount').textContent = stats.absent;
 
-        // Update present list
         const presentList = document.getElementById('ctPresentList');
         if (result.data.records && result.data.records.length > 0) {
             presentList.innerHTML = result.data.records.map(r => `
@@ -260,7 +287,6 @@ async function loadCTData() {
             presentList.innerHTML = '<p class="empty-list">No students marked present yet</p>';
         }
 
-        // Update absent list
         const absentList = document.getElementById('ctAbsentList');
         if (result.data.absentStudents && result.data.absentStudents.length > 0) {
             absentList.innerHTML = result.data.absentStudents.map(s => `
@@ -297,11 +323,7 @@ async function markCTAttendance() {
     if (result && result.success) {
         cardInput.value = '';
         cardInput.focus();
-        
-        // Show success
         alert(`✓ Attendance marked for ${result.data.student.name}`);
-        
-        // Reload data
         await loadCTData();
     } else {
         alert(result?.message || 'Failed to mark attendance');
@@ -347,11 +369,9 @@ function showAddStudentModal() {
 // ==========================================
 // SUBJECT TEACHER SECTION
 // ==========================================
-
 async function initSTSection() {
     let html = '';
 
-    // Class selector
     html += `
         <div class="class-selector">
             <label>Select Class:</label>
@@ -365,10 +385,8 @@ async function initSTSection() {
         </div>
     `;
 
-    // Stats only (no names, no controls)
     html += '<div id="stStats"><p class="loading">Loading stats...</p></div>';
 
-    // Info notice
     html += `
         <div style="background: #e3f2fd; padding: 15px; border-radius: 8px; margin-top: 20px;">
             <strong>ℹ️ Subject Teacher Access:</strong>
@@ -379,8 +397,6 @@ async function initSTSection() {
     `;
 
     stContent.innerHTML = html;
-
-    // Load data
     await loadSTData();
 }
 
@@ -423,7 +439,6 @@ function handleSTClassChange(className) {
 // ==========================================
 // LOGOUT
 // ==========================================
-
 logoutBtn.addEventListener('click', async () => {
     await apiCall('/auth/logout', { method: 'POST' });
     localStorage.clear();
@@ -433,5 +448,4 @@ logoutBtn.addEventListener('click', async () => {
 // ==========================================
 // INITIALIZE
 // ==========================================
-
 initDashboard();

@@ -1,7 +1,7 @@
 /**
  * SQLite Database Configuration with Authentication
  * Enhanced for CT (1) + ST (multiple) assignments
- * FIXED: Added missing student and attendance functions
+ * WITH STUDENT PASSWORD SUPPORT
  */
 
 const Database = require('better-sqlite3');
@@ -67,7 +67,7 @@ db.exec(`
 `);
 
 /**
- * Students Table
+ * Students Table - WITH PASSWORD SUPPORT
  */
 db.exec(`
   CREATE TABLE IF NOT EXISTS students (
@@ -76,6 +76,7 @@ db.exec(`
     name TEXT NOT NULL,
     class TEXT,
     roll_number TEXT,
+    password_hash TEXT,
     registered_at DATETIME DEFAULT CURRENT_TIMESTAMP
   )
 `);
@@ -106,6 +107,26 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_sessions_teacher ON sessions(teacher_id);
   CREATE INDEX IF NOT EXISTS idx_teacher_classes ON teacher_classes(teacher_id);
 `);
+
+// ==========================================
+// ADD PASSWORD COLUMN TO EXISTING DATABASES
+// ==========================================
+const checkPasswordColumn = db.prepare(`
+  SELECT COUNT(*) as count 
+  FROM pragma_table_info('students') 
+  WHERE name='password_hash'
+`);
+
+const passwordColumnExists = checkPasswordColumn.get();
+
+if (passwordColumnExists.count === 0) {
+  try {
+    db.exec(`ALTER TABLE students ADD COLUMN password_hash TEXT`);
+    console.log('✓ Added password_hash column to students table');
+  } catch (error) {
+    console.log('⚠️  Password column may already exist');
+  }
+}
 
 console.log('✓ Database tables created/verified');
 
@@ -194,7 +215,7 @@ const cleanExpiredSessions = db.prepare(`
 `);
 
 // ==========================================
-// TEACHER CLASS ASSIGNMENT - ENHANCED
+// TEACHER CLASS ASSIGNMENT
 // ==========================================
 
 const assignTeacherToClass = db.prepare(`
@@ -225,19 +246,16 @@ const getAllClassAssignments = db.prepare(`
   ORDER BY tc.class_name, tc.is_class_teacher DESC, t.name
 `);
 
-// NEW: Check if teacher already has a CT assignment
 const getTeacherCTAssignment = db.prepare(`
   SELECT * FROM teacher_classes 
   WHERE teacher_id = ? AND is_class_teacher = 1
 `);
 
-// NEW: Count CT assignments for a teacher
 const countCTAssignments = db.prepare(`
   SELECT COUNT(*) as count FROM teacher_classes 
   WHERE teacher_id = ? AND is_class_teacher = 1
 `);
 
-// NEW: Check if class already has a CT
 const getClassCT = db.prepare(`
   SELECT tc.*, t.name as teacher_name 
   FROM teacher_classes tc
@@ -246,12 +264,12 @@ const getClassCT = db.prepare(`
 `);
 
 // ==========================================
-// STUDENT OPERATIONS - FIXED
+// STUDENT OPERATIONS - WITH PASSWORD SUPPORT
 // ==========================================
 
 const registerStudent = db.prepare(`
-  INSERT INTO students (card_id, name, class, roll_number)
-  VALUES (?, ?, ?, ?)
+  INSERT INTO students (card_id, name, class, roll_number, password_hash)
+  VALUES (?, ?, ?, ?, ?)
 `);
 
 const getStudentByCardId = db.prepare(`
@@ -270,10 +288,21 @@ const getStudentById = db.prepare(`
   SELECT * FROM students WHERE id = ?
 `);
 
-// FIXED: Added card_id parameter
 const updateStudent = db.prepare(`
   UPDATE students 
   SET card_id = ?, name = ?, class = ?, roll_number = ?
+  WHERE id = ?
+`);
+
+const updateStudentWithPassword = db.prepare(`
+  UPDATE students 
+  SET card_id = ?, name = ?, class = ?, roll_number = ?, password_hash = ?
+  WHERE id = ?
+`);
+
+const updateStudentPassword = db.prepare(`
+  UPDATE students 
+  SET password_hash = ?
   WHERE id = ?
 `);
 
@@ -451,7 +480,7 @@ module.exports = {
     }
   },
   
-  // Teacher class assignments - ENHANCED
+  // Teacher class assignments
   teacherClasses: {
     assign: (teacherId, className, isClassTeacher) => {
       return assignTeacherToClass.run(teacherId, className, isClassTeacher ? 1 : 0);
@@ -473,27 +502,25 @@ module.exports = {
       return getAllClassAssignments.all();
     },
     
-    // NEW: Get teacher's CT assignment (should be max 1)
     getCTAssignment: (teacherId) => {
       return getTeacherCTAssignment.get(teacherId);
     },
     
-    // NEW: Check if teacher already has CT role
     hasCTAssignment: (teacherId) => {
       const result = countCTAssignments.get(teacherId);
       return result.count > 0;
     },
     
-    // NEW: Get class's CT (should be max 1 per class)
     getClassCT: (className) => {
       return getClassCT.get(className);
     }
   },
   
-  // Student operations - FIXED
+  // Student operations - WITH PASSWORD SUPPORT
   students: {
-    register: (cardId, name, studentClass, rollNumber) => {
-      return registerStudent.run(cardId, name, studentClass, rollNumber);
+    register: (cardId, name, studentClass, rollNumber, password) => {
+      const hashedPassword = password ? bcrypt.hashSync(password, 10) : null;
+      return registerStudent.run(cardId, name, studentClass, rollNumber, hashedPassword);
     },
     
     getByCardId: (cardId) => {
@@ -512,9 +539,25 @@ module.exports = {
       return getStudentsByClass.all(className);
     },
     
-    // FIXED: Added cardId parameter and correct parameter order
-    update: (id, cardId, name, studentClass, rollNumber) => {
-      return updateStudent.run(cardId, name, studentClass, rollNumber, id);
+    update: (id, cardId, name, studentClass, rollNumber, password) => {
+      if (password) {
+        // Update with new password
+        const hashedPassword = bcrypt.hashSync(password, 10);
+        return updateStudentWithPassword.run(cardId, name, studentClass, rollNumber, hashedPassword, id);
+      } else {
+        // Update without changing password
+        return updateStudent.run(cardId, name, studentClass, rollNumber, id);
+      }
+    },
+    
+    updatePassword: (id, newPassword) => {
+      const hashedPassword = bcrypt.hashSync(newPassword, 10);
+      return updateStudentPassword.run(hashedPassword, id);
+    },
+    
+    verifyPassword: (plainPassword, hashedPassword) => {
+      if (!hashedPassword) return false;
+      return bcrypt.compareSync(plainPassword, hashedPassword);
     },
     
     delete: (id) => {
@@ -527,7 +570,7 @@ module.exports = {
     }
   },
   
-  // Attendance operations - ENHANCED WITH MISSING FUNCTIONS
+  // Attendance operations
   attendance: {
     record: (cardId, studentId, studentName, studentClass, timestamp) => {
       return recordAttendance.run(cardId, studentId, studentName, studentClass, timestamp);
@@ -586,7 +629,6 @@ module.exports = {
       return getAttendanceStatsByClass.get(className);
     },
     
-    // NEW: Get attendance count by student ID
     getCountByStudent: (studentId) => {
       const stmt = db.prepare(`
         SELECT COUNT(*) as count 
@@ -597,7 +639,6 @@ module.exports = {
       return result.count;
     },
     
-    // NEW: Get last attendance by student ID
     getLastByStudent: (studentId) => {
       const stmt = db.prepare(`
         SELECT * FROM attendance 
@@ -608,7 +649,6 @@ module.exports = {
       return stmt.get(studentId);
     },
     
-    // NEW: Get attendance records by student ID with limit
     getByStudentId: (studentId, limit = 50) => {
       const stmt = db.prepare(`
         SELECT * FROM attendance 
@@ -619,4 +659,7 @@ module.exports = {
       return stmt.all(studentId, limit);
     }
   }
+
+  
 };
+
